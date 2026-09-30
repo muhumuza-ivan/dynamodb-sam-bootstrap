@@ -17,14 +17,21 @@ Parameters:
   GitHubOrg:
     Type: String
     Description: GitHub user or organisation that owns the application repository.
+  GitHubOrgId:
+    Type: String
+    AllowedPattern: "^[0-9]+$"
+    Description: Numeric ID of GitHubOrg (`gh api users/<org> --jq .id`).
   GitHubRepo:
     Type: String
     Default: dynamodb-sam
     Description: Name of the application repository (not this bootstrap repo).
-  GitHubEnvironmentName:
+  GitHubRepoId:
     Type: String
-    AllowedValues: [development, production]
-    Description: GitHub Actions environment allowed to assume the pipeline execution role.
+    AllowedPattern: "^[0-9]+$"
+    Description: Numeric ID of GitHubRepo (`gh api repos/<org>/<repo> --jq .id`).
+  DeploymentBranch:
+    Type: String
+    Description: The only branch of the app repo allowed to assume the pipeline execution role (dev=develop, prod=main).
   ArtifactRetentionDays:
     Type: Number
     Default: 30
@@ -114,6 +121,12 @@ Resources:
                   - dynamodb:DescribeLimits
                   - dynamodb:ListTables
                 Resource: "*"
+              # With `sam deploy --role-arn`, CloudFormation expands the SAM
+              # transform as this role, not as the pipeline execution role.
+              - Sid: UseSamTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
       Tags:
         - Key: Application
           Value: !Ref AppName
@@ -124,7 +137,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub ${AppName}-${Environment}-pipeline-exec-role
-      Description: !Sub Assumed by GitHub Actions (${GitHubEnvironmentName} environment) to deploy ${AppName}.
+      Description: !Sub Assumed by GitHub Actions (${DeploymentBranch} branch) to deploy ${AppName}.
       MaxSessionDuration: 3600
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -136,9 +149,10 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                # Only jobs that declare `environment: <GitHubEnvironmentName>`
-                # in the application repo can assume this role.
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:${GitHubEnvironmentName}
+                # Only pushes/dispatches on DeploymentBranch of the app repo can
+                # assume this role. The repo uses GitHub's immutable subject
+                # format (owner@id/repo@id), which survives renames.
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${DeploymentBranch}
       Policies:
         - PolicyName: SamPipelineDeploy
           PolicyDocument:
@@ -174,19 +188,19 @@ Resources:
                 Action:
                   - cloudformation:ValidateTemplate
                 Resource: "*"
+              # Same S3 actions as SAM's own managed bootstrap template, limited
+              # to this environment's bucket.
               - Sid: ArtifactsBucketAccess
                 Effect: Allow
                 Action:
-                  - s3:ListBucket
-                  - s3:GetBucketLocation
-                Resource: !GetAtt ArtifactsBucket.Arn
-              - Sid: ArtifactsObjectAccess
-                Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:PutObjectTagging
-                Resource: !Sub ${ArtifactsBucket.Arn}/*
+                  - s3:DeleteObject
+                  - s3:GetObject*
+                  - s3:PutObject*
+                  - s3:GetBucket*
+                  - s3:List*
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub ${ArtifactsBucket.Arn}/*
       Tags:
         - Key: Application
           Value: !Ref AppName
@@ -202,5 +216,5 @@ Outputs:
     Value: !GetAtt PipelineExecutionRole.Arn
   CloudFormationExecutionRoleArn:
     Value: !GetAtt CloudFormationExecutionRole.Arn
-  GitHubEnvironmentName:
-    Value: !Ref GitHubEnvironmentName
+  DeploymentBranch:
+    Value: !Ref DeploymentBranch
