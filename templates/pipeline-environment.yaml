@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Per-environment SAM pipeline resources: a dedicated artifact bucket, a
+  pipeline execution role assumed by GitHub Actions via OIDC, and a
+  CloudFormation execution role used by `sam deploy --role-arn`.
+  Deploy once per environment (dev, prod).
+
+Parameters:
+  AppName:
+    Type: String
+    Default: dynamodb-sam
+    AllowedPattern: "^[a-z0-9-]+$"
+    Description: Application name. Must match the AppName used by the SAM app stack.
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+  GitHubOrg:
+    Type: String
+    Description: GitHub user or organisation that owns the application repository.
+  GitHubRepo:
+    Type: String
+    Default: dynamodb-sam
+    Description: Name of the application repository (not this bootstrap repo).
+  GitHubEnvironmentName:
+    Type: String
+    AllowedValues: [development, production]
+    Description: GitHub Actions environment allowed to assume the pipeline execution role.
+  ArtifactRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${AppName}-artifacts-${Environment}-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifacts
+            Status: Enabled
+            ExpirationInDays: !Ref ArtifactRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref ArtifactRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub ${ArtifactsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-${Environment}-cfn-exec-role
+      Description: !Sub Assumed by CloudFormation to create ${AppName} ${Environment} resources.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ManageEnvironmentDynamoDbTables
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Tables are scoped to the environment prefix so the dev role can
+              # never touch prod tables and vice versa.
+              - Sid: ManageScopedTables
+                Effect: Allow
+                Action: dynamodb:*
+                Resource:
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AppName}-${Environment}-*
+              - Sid: AccountLevelReads
+                Effect: Allow
+                Action:
+                  - dynamodb:DescribeLimits
+                  - dynamodb:ListTables
+                Resource: "*"
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-${Environment}-pipeline-exec-role
+      Description: !Sub Assumed by GitHub Actions (${GitHubEnvironmentName} environment) to deploy ${AppName}.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Only jobs that declare `environment: <GitHubEnvironmentName>`
+                # in the application repo can assume this role.
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:${GitHubEnvironmentName}
+      Policies:
+        - PolicyName: SamPipelineDeploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PassCloudFormationExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationExecutionRole.Arn
+              - Sid: ManageEnvironmentStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ListStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource:
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-${Environment}/*
+              - Sid: UseSamTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+              - Sid: TemplateValidation
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+              - Sid: ArtifactsBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !GetAtt ArtifactsBucket.Arn
+              - Sid: ArtifactsObjectAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource: !Sub ${ArtifactsBucket.Arn}/*
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+  ArtifactsBucketArn:
+    Value: !GetAtt ArtifactsBucket.Arn
+  PipelineExecutionRoleArn:
+    Value: !GetAtt PipelineExecutionRole.Arn
+  CloudFormationExecutionRoleArn:
+    Value: !GetAtt CloudFormationExecutionRole.Arn
+  GitHubEnvironmentName:
+    Value: !Ref GitHubEnvironmentName

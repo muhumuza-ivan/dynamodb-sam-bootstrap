@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Account-wide GitHub Actions OIDC identity provider. Only one provider per URL
+  can exist in an AWS account, so creation is optional for accounts that
+  already have one.
+
+Parameters:
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Set to false if token.actions.githubusercontent.com already exists in this account.
+
+Conditions:
+  ShouldCreateProvider: !Equals [!Ref CreateOidcProvider, "true"]
+  ShouldSkipProvider: !Not [!Condition ShouldCreateProvider]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # A stack needs at least one resource; this no-op keeps it valid when the
+  # provider already exists outside of this stack.
+  Placeholder:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Condition: ShouldSkipProvider
+
+Outputs:
+  OidcProviderArn:
+    Description: ARN of the GitHub Actions OIDC provider
+    Value: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+    Export:
+      Name: github-actions-oidc-provider-arn
